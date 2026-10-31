@@ -98,6 +98,9 @@ bool sys_ftpsrv_config_has_mounts(const struct SysFtpConfig* cfg);
 // creates /config and /config/sys-ftpsrv if needed.
 void sys_ftpsrv_config_create_dir(void);
 
+// these write to config.ini, whose folder must exist (see
+// sys_ftpsrv_config_create_dir()). each call rewrites the file, so they are
+// slow-ish: the overlay calls them from a background thread.
 bool sys_ftpsrv_config_set_bool(const char* section, const char* key, bool value);
 bool sys_ftpsrv_config_set_long(const char* section, const char* key, long value);
 // values containing '#', ';' or '"' are quoted when written and unquoted on load.

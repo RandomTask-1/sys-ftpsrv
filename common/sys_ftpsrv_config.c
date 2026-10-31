@@ -197,6 +197,5 @@ bool sys_ftpsrv_config_set_long(const char* section, const char* key, long value
 }
 
 bool sys_ftpsrv_config_set_string(const char* section, const char* key, const char* value) {
-    sys_ftpsrv_config_create_dir();
     return cfgini_set(SYS_FTPSRV_CONFIG_PATH, section, key, value);
 }

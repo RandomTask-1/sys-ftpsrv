@@ -26,6 +26,7 @@
 #include <cctype>
 #include <cerrno>
 #include <cstring>
+#include <deque>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
@@ -55,10 +56,9 @@ constexpr std::string_view PASS_MIXED = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqr
 constexpr std::string_view PASS_DIGITS = "0123456789";
 constexpr std::string_view PASS_SPECIAL = "!@#$%^&*";
 
-// how often (in frames) the server state and ip address are polled.
-constexpr u32 POLL_INTERVAL = 30;
-// how often (in polls, ~3s) the port is probed for sphaira's ftp server. only
-// done whilst the overlay is visible and both use the same port.
+// how often (in polls of POLL_INTERVAL_NS, ~3s) the port is probed for
+// sphaira's ftp server. only done whilst the overlay is visible and both use
+// the same port.
 constexpr u32 PROBE_EVERY_POLLS = 6;
 
 // set once the socket driver is up, the port probe is skipped otherwise.
@@ -428,155 +428,456 @@ void AddNote(tsl::elm::List* list, std::initializer_list<const char*> lines, Not
 }
 
 // ---------------------------------------------------------------------------
-// shared state, read by every page and by the status panel drawn on each.
+// shared state. the ui thread only ever touches memory: every slow call (sd
+// card writes, pm, nifm, the port probe) runs on a background worker so that
+// the overlay keeps drawing and taking input whilst they happen.
+//
+// g_state is shared by both threads and guarded by g_state_mutex. the ui
+// thread is the only writer of cfg / user_presets, the worker is the only
+// writer of the server status fields.
 // ---------------------------------------------------------------------------
 
-struct State {
-    SysFtpConfig cfg{};
-    SphairaFtpInfo sphaira{};
-    std::vector<std::string> user_presets{};
-    bool installed{};
-    bool running{};
-    // a setting changed whilst the server was running, R restarts to apply it.
-    bool dirty{};
-    u32 ip_raw{};
-    std::string ip{};
-    std::string error{};
-    PortOwner port_owner{PortOwner::Unknown};
-    u32 frame_counter{};
-    u32 probe_countdown{};
+enum class Busy {
+    None,
+    Starting,
+    Stopping,
+    Restarting,
 };
 
+struct State {
+    // config, as shown in the ui (saved by the worker shortly after a change).
+    SysFtpConfig cfg{};
+    std::vector<std::string> user_presets{};
+
+    // server status, updated by the worker.
+    bool installed{};
+    bool running{};
+    u32 ip_raw{};
+    std::string ip{};
+    SphairaFtpInfo sphaira{};
+    PortOwner port_owner{PortOwner::Unknown};
+    std::string error{};
+
+    // a server setting changed whilst it was running, R restarts to apply it.
+    bool dirty{};
+    // a start / stop is queued or in progress.
+    Busy busy{Busy::None};
+
+    // bumped whenever anything shown in a list changes, so pages know to refresh.
+    u32 version{};
+};
+
+Mutex g_state_mutex;
 State g_state;
 
+class StateLock {
+public:
+    StateLock() { mutexLock(&g_state_mutex); }
+    ~StateLock() { mutexUnlock(&g_state_mutex); }
+    StateLock(const StateLock&) = delete;
+    StateLock& operator=(const StateLock&) = delete;
+};
+
+// these expect g_state_mutex to be held.
 // sphaira's FTP Install starts its server even when "ftp_enabled" is off,
 // so a matching port is a conflict regardless of that setting.
-bool PortConflict() {
+bool PortConflictLocked() {
     return g_state.sphaira.installed && g_state.sphaira.port == g_state.cfg.port;
 }
 
 // true when a non sys-ftpsrv ftp server answers on sphaira's (shared) port.
 // can't see sphaira's server when sys-ftpsrv already holds the port, as
 // sphaira's then just retries in the background without a socket.
-bool SphairaServerRunning() {
-    return PortConflict() && g_state.port_owner == PortOwner::Other;
+bool SphairaServerRunningLocked() {
+    return PortConflictLocked() && g_state.port_owner == PortOwner::Other;
 }
 
-void ProbeSphaira() {
-    g_state.probe_countdown = PROBE_EVERY_POLLS;
-    if (!g_sockets_ready || !PortConflict()) {
-        g_state.port_owner = PortOwner::Unknown;
-        return;
+u32 StateVersion() {
+    StateLock lock;
+    return g_state.version;
+}
+
+// ---------------------------------------------------------------------------
+// background worker: runs queued commands in order, and polls the server
+// status every POLL_INTERVAL_NS whilst the overlay is visible.
+// ---------------------------------------------------------------------------
+
+constexpr u64 POLL_INTERVAL_NS = 500'000'000ULL;
+
+enum class CommandType {
+    Save,       // write section.key = value to config.ini
+    SetBoot,    // create / remove boot2.flag
+    Start,
+    Stop,
+    Apply,      // stop then start, to apply changed settings
+};
+
+struct Command {
+    CommandType type;
+    const char* section;    // Save only, always a string literal
+    const char* key;        // Save only, always a string literal
+    std::string value;      // Save only
+    bool affects_server;    // Save: needs a restart to take effect
+    bool enable;            // SetBoot only
+};
+
+class Worker {
+public:
+    void Start() {
+        mutexInit(&m_mutex);
+        condvarInit(&m_cv);
+        m_quit = false;
+        m_visible = true;
+        m_poll_now = false;
+
+        if (R_SUCCEEDED(threadCreate(&m_thread, ThreadFunc, this, nullptr, 0x10000, 0x2E, -2))) {
+            m_running = R_SUCCEEDED(threadStart(&m_thread));
+            if (!m_running) {
+                threadClose(&m_thread);
+            }
+        }
     }
 
-    g_state.port_owner = ProbePort(g_state.ip_raw, g_state.cfg.port);
-}
+    // finishes every queued command (so no setting is lost) then exits.
+    void Stop() {
+        if (!m_running) {
+            return;
+        }
+
+        mutexLock(&m_mutex);
+        m_quit = true;
+        condvarWakeAll(&m_cv);
+        mutexUnlock(&m_mutex);
+
+        threadWaitForExit(&m_thread);
+        threadClose(&m_thread);
+        m_running = false;
+    }
+
+    // queues a config write. a newer value for the same key replaces one that
+    // hasn't been written yet, unless a start / stop sits between them.
+    void Save(const char* section, const char* key, std::string value, bool affects_server) {
+        mutexLock(&m_mutex);
+        bool merged = false;
+        for (auto it = m_queue.rbegin(); it != m_queue.rend(); ++it) {
+            if (it->type != CommandType::Save && it->type != CommandType::SetBoot) {
+                break;
+            }
+            if (it->type == CommandType::Save && !std::strcmp(it->section, section) && !std::strcmp(it->key, key)) {
+                it->value = std::move(value);
+                it->affects_server |= affects_server;
+                merged = true;
+                break;
+            }
+        }
+        if (!merged) {
+            m_queue.push_back({CommandType::Save, section, key, std::move(value), affects_server, false});
+        }
+        condvarWakeOne(&m_cv);
+        mutexUnlock(&m_mutex);
+    }
+
+    void Post(CommandType type, bool enable = false) {
+        mutexLock(&m_mutex);
+        m_queue.push_back({type, nullptr, nullptr, {}, false, enable});
+        condvarWakeOne(&m_cv);
+        mutexUnlock(&m_mutex);
+    }
+
+    // polling stops whilst the overlay is hidden, so it doesn't keep reading
+    // the sd card in the background during a game. showing it polls at once.
+    void SetVisible(bool visible) {
+        mutexLock(&m_mutex);
+        m_visible = visible;
+        m_poll_now = visible;
+        condvarWakeOne(&m_cv);
+        mutexUnlock(&m_mutex);
+    }
+
+    // first poll, done before the first frame so that the panel is right
+    // straight away. only called before Start().
+    void PollOnce() {
+        Poll(true);
+    }
+
+private:
+    static void ThreadFunc(void* arg) {
+        static_cast<Worker*>(arg)->Run();
+    }
+
+    static u64 Now() {
+        return armTicksToNs(armGetSystemTick());
+    }
+
+    void Run() {
+        u64 next_poll = Now() + POLL_INTERVAL_NS;
+
+        mutexLock(&m_mutex);
+        while (true) {
+            if (!m_queue.empty()) {
+                Command cmd = std::move(m_queue.front());
+                m_queue.pop_front();
+                mutexUnlock(&m_mutex);
+
+                Execute(cmd);
+
+                mutexLock(&m_mutex);
+                continue;
+            }
+
+            if (m_quit) {
+                break;
+            }
+
+            const u64 now = Now();
+            if (m_visible && (m_poll_now || now >= next_poll)) {
+                m_poll_now = false;
+                mutexUnlock(&m_mutex);
+
+                Poll(false);
+
+                mutexLock(&m_mutex);
+                next_poll = Now() + POLL_INTERVAL_NS;
+                continue;
+            }
+
+            // sleeps until the next poll is due, or until woken by a command.
+            condvarWaitTimeout(&m_cv, &m_mutex, m_visible ? next_poll - now : UINT64_MAX);
+        }
+        mutexUnlock(&m_mutex);
+    }
+
+    // true if a queued (not yet written) setting needs a restart to apply.
+    bool HasPendingServerSave() {
+        mutexLock(&m_mutex);
+        bool pending = false;
+        for (const auto& cmd : m_queue) {
+            if (cmd.type == CommandType::Save && cmd.affects_server) {
+                pending = true;
+                break;
+            }
+        }
+        mutexUnlock(&m_mutex);
+        return pending;
+    }
+
+    void SetError(const char* error) {
+        StateLock lock;
+        g_state.error = error;
+        g_state.version++;
+    }
+
+    void Execute(const Command& cmd) {
+        switch (cmd.type) {
+            case CommandType::Save:
+                if (!sys_ftpsrv_config_set_string(cmd.section, cmd.key, cmd.value.c_str())) {
+                    SetError("Couldn't save settings");
+                }
+                break;
+
+            case CommandType::SetBoot:
+                if (!SetBootEnabled(cmd.enable)) {
+                    SetError("Couldn't change boot flag");
+                }
+                break;
+
+            case CommandType::Start:
+                DoStart();
+                break;
+
+            case CommandType::Stop:
+                DoStop();
+                break;
+
+            case CommandType::Apply:
+                if (DoStop()) {
+                    DoStart();
+                }
+                break;
+        }
+
+        if (cmd.type == CommandType::Start || cmd.type == CommandType::Stop || cmd.type == CommandType::Apply) {
+            {
+                StateLock lock;
+                g_state.busy = Busy::None;
+                g_state.version++;
+            }
+            // give a freshly launched sysmodule a moment to bind before probing.
+            m_probe_countdown = 1;
+        }
+    }
+
+    bool DoStart() {
+        bool installed, has_login;
+        {
+            StateLock lock;
+            installed = g_state.installed;
+            has_login = sys_ftpsrv_config_has_login(&g_state.cfg);
+        }
+
+        std::string error;
+        if (!installed) {
+            error = "Not installed";
+        } else if (!has_login) {
+            // the sysmodule would exit straight away, so don't bother.
+            error = "No login set";
+        } else if (const auto rc = StartServer(); R_FAILED(rc)) {
+            error = ResultToString(rc);
+        }
+
+        const bool running = IsRunning();
+        // settings saved before this point are what the server started with,
+        // ones still queued (changed whilst starting) will need a restart.
+        const bool dirty = running && HasPendingServerSave();
+
+        StateLock lock;
+        g_state.error = error;
+        g_state.running = running;
+        if (error.empty()) {
+            g_state.dirty = dirty;
+        }
+        g_state.version++;
+        return error.empty();
+    }
+
+    bool DoStop() {
+        const auto rc = StopServer();
+        const bool running = IsRunning();
+
+        StateLock lock;
+        g_state.error = R_FAILED(rc) ? ResultToString(rc) : std::string{};
+        g_state.running = running;
+        g_state.version++;
+        return R_SUCCEEDED(rc);
+    }
+
+    void Poll(bool force_probe) {
+        long port;
+        {
+            StateLock lock;
+            port = g_state.cfg.port;
+        }
+
+        SphairaFtpInfo sphaira;
+        sys_ftpsrv_get_sphaira_ftp(&sphaira);
+        const bool installed = IsInstalled();
+        const bool running = IsRunning();
+        const u32 ip_raw = GetIpAddressRaw();
+        const bool conflict = sphaira.installed && sphaira.port == port;
+
+        bool changed;
+        PortOwner owner;
+        long probed_port;
+        {
+            StateLock lock;
+            const auto& s = g_state;
+            changed = installed != s.installed || running != s.running || ip_raw != s.ip_raw ||
+                sphaira.installed != s.sphaira.installed || sphaira.enabled != s.sphaira.enabled ||
+                sphaira.port != s.sphaira.port;
+            owner = s.port_owner;
+            probed_port = m_probed_port;
+        }
+
+        // the port is only probed when it's shared with sphaira, every
+        // PROBE_EVERY_POLLS polls or as soon as something changed.
+        if (!g_sockets_ready || !conflict) {
+            owner = PortOwner::Unknown;
+        } else if (force_probe || changed || port != probed_port || !m_probe_countdown || !--m_probe_countdown) {
+            owner = ProbePort(ip_raw, port);
+            m_probed_port = port;
+            m_probe_countdown = PROBE_EVERY_POLLS;
+        }
+
+        StateLock lock;
+        auto& s = g_state;
+        if (running != s.running && !running && s.busy == Busy::None && s.error.empty()) {
+            // the server stopped without us asking, most likely a bad config.
+            s.error = sys_ftpsrv_config_has_login(&s.cfg) ? "Exited unexpectedly" : "No login set";
+        }
+        if (changed || owner != s.port_owner) {
+            s.installed = installed;
+            s.running = running;
+            s.ip_raw = ip_raw;
+            s.ip = IpToString(ip_raw);
+            s.sphaira = sphaira;
+            s.port_owner = owner;
+            s.version++;
+        }
+    }
+
+    Thread m_thread{};
+    Mutex m_mutex{};
+    CondVar m_cv{};
+    std::deque<Command> m_queue{};
+    bool m_running{};
+    bool m_quit{};
+    bool m_visible{};
+    bool m_poll_now{};
+    // worker thread only.
+    u32 m_probe_countdown{};
+    long m_probed_port{};
+};
+
+Worker g_worker;
 
 void LoadState() {
     // done before any setting is written, otherwise cfgini would create a
     // bare config.ini and the template (with its comments) is never used.
+    sys_ftpsrv_config_create_dir();
     EnsureConfigFromTemplate();
+
+    StateLock lock;
     sys_ftpsrv_config_load(&g_state.cfg);
     g_state.user_presets = ParseUserPresets(g_state.cfg);
-    sys_ftpsrv_get_sphaira_ftp(&g_state.sphaira);
-    g_state.installed = IsInstalled();
-    g_state.running = IsRunning();
-    g_state.ip_raw = GetIpAddressRaw();
-    g_state.ip = IpToString(g_state.ip_raw);
-    ProbeSphaira();
 }
 
-// called every frame by the visible page, does the actual work every
-// POLL_INTERVAL frames. returns true if something shown in a list changed.
-bool PollState() {
-    auto& s = g_state;
-    if (++s.frame_counter < POLL_INTERVAL) {
-        return false;
-    }
-    s.frame_counter = 0;
-
-    // sphaira's settings may have been changed since the overlay opened.
-    SphairaFtpInfo sphaira;
-    sys_ftpsrv_get_sphaira_ftp(&sphaira);
-    const bool sphaira_changed = sphaira.installed != s.sphaira.installed ||
-        sphaira.enabled != s.sphaira.enabled || sphaira.port != s.sphaira.port;
-    s.sphaira = sphaira;
-
-    const bool running = IsRunning();
-    const auto ip_raw = GetIpAddressRaw();
-    const bool state_changed = running != s.running || ip_raw != s.ip_raw || sphaira_changed;
-
-    if (state_changed) {
-        if (running != s.running && !running && s.error.empty()) {
-            // the server stopped without us asking, most likely a bad config.
-            s.error = sys_ftpsrv_config_has_login(&s.cfg) ? "Exited unexpectedly" : "No login set";
+// changes a setting: updates the ui state straight away and queues the write.
+// call with the new value already stored in g_state.cfg.
+void ChangeSetting(const char* section, const char* key, std::string value, bool affects_server = true) {
+    {
+        StateLock lock;
+        if (affects_server) {
+            // a server that is running, or about to start, won't see the change.
+            g_state.dirty = g_state.running || g_state.busy == Busy::Starting || g_state.busy == Busy::Restarting;
+            g_state.error.clear();
         }
-        s.running = running;
-        s.ip_raw = ip_raw;
-        s.ip = IpToString(ip_raw);
+        g_state.version++;
     }
-
-    const auto old_owner = s.port_owner;
-    if (state_changed || !s.probe_countdown || !--s.probe_countdown) {
-        ProbeSphaira();
-    }
-
-    return state_changed || old_owner != s.port_owner;
-}
-
-void MarkDirty() {
-    g_state.dirty = g_state.running;
-    g_state.error.clear();
-    // the port may have changed, re-check it on the next poll.
-    g_state.probe_countdown = 1;
-    if (!PortConflict()) {
-        g_state.port_owner = PortOwner::Unknown;
-    }
-}
-
-void SetServerRunning(bool start) {
-    auto& s = g_state;
-    s.error.clear();
-
-    if (start) {
-        if (!s.installed) {
-            s.error = "Not installed";
-        } else if (!sys_ftpsrv_config_has_login(&s.cfg)) {
-            // the sysmodule would exit straight away, so don't bother.
-            s.error = "No login set";
-        } else if (const auto rc = StartServer(); R_FAILED(rc)) {
-            s.error = ResultToString(rc);
-        } else {
-            s.dirty = false;
-        }
-    } else if (const auto rc = StopServer(); R_FAILED(rc)) {
-        s.error = ResultToString(rc);
-    }
-
-    s.running = IsRunning();
-    // give a freshly launched sysmodule a moment to bind before probing.
-    s.probe_countdown = 1;
+    g_worker.Save(section, key, std::move(value), affects_server);
 }
 
 // L: stop the server.
-void StopAction() {
-    if (g_state.running) {
-        SetServerRunning(false);
+void RequestStop() {
+    StateLock lock;
+    if (g_state.busy != Busy::None || !g_state.running) {
+        return;
     }
+    g_state.busy = Busy::Stopping;
+    g_state.error.clear();
+    g_state.version++;
+    g_worker.Post(CommandType::Stop);
 }
 
 // R: start the server, or restart it to apply pending changes. does nothing
 // when it's already running with nothing to apply, to avoid needlessly
-// dropping connections.
-void StartOrApplyAction() {
-    if (!g_state.running) {
-        SetServerRunning(true);
-    } else if (g_state.dirty) {
-        SetServerRunning(false);
-        if (!g_state.running) {
-            SetServerRunning(true);
-        }
+// dropping connections. ignored whilst a start / stop is in progress.
+void RequestStartOrApply() {
+    StateLock lock;
+    if (g_state.busy != Busy::None) {
+        return;
     }
+
+    if (!g_state.running) {
+        g_state.busy = Busy::Starting;
+        g_worker.Post(CommandType::Start);
+    } else if (g_state.dirty) {
+        g_state.busy = Busy::Restarting;
+        g_worker.Post(CommandType::Apply);
+    } else {
+        return;
+    }
+    g_state.error.clear();
+    g_state.version++;
 }
 
 // ---------------------------------------------------------------------------
@@ -619,9 +920,10 @@ tsl::Color FaintColor() {
 }
 
 std::array<PanelRow, PANEL_ROWS> BuildPanel() {
+    StateLock lock;
     const auto& s = g_state;
-    const bool conflict = PortConflict();
-    const bool sphaira_running = SphairaServerRunning();
+    const bool conflict = PortConflictLocked();
+    const bool sphaira_running = SphairaServerRunningLocked();
     const auto conflict_color = sphaira_running ? tsl::warningTextColor : CAUTION_COLOR;
 
     std::array<PanelRow, PANEL_ROWS> rows{};
@@ -630,15 +932,22 @@ std::array<PanelRow, PANEL_ROWS> BuildPanel() {
     server.label = "FTP Server";
     server.value = s.running ? "On" : "Off";
     server.color = s.running ? tsl::onTextColor : tsl::offTextColor;
-    if (s.running) {
-        server.hint = std::string(GLYPH_L) + " Stop";
-    } else {
-        server.hint = std::string(GLYPH_R) + " Start";
+    if (s.busy == Busy::None) {
+        server.hint = s.running ? std::string(GLYPH_L) + " Stop" : std::string(GLYPH_R) + " Start";
     }
 
     auto& status = rows[PanelRow_Status];
     status.label = "Status";
-    if (!s.error.empty()) {
+    if (s.busy == Busy::Starting) {
+        status.value = "Starting...";
+        status.color = tsl::infoTextColor;
+    } else if (s.busy == Busy::Stopping) {
+        status.value = "Stopping...";
+        status.color = tsl::infoTextColor;
+    } else if (s.busy == Busy::Restarting) {
+        status.value = "Restarting...";
+        status.color = tsl::infoTextColor;
+    } else if (!s.error.empty()) {
         status.value = s.error;
         status.color = tsl::warningTextColor;
     } else if (!s.installed) {
@@ -674,7 +983,9 @@ std::array<PanelRow, PANEL_ROWS> BuildPanel() {
     if (s.running && s.dirty) {
         changes.value = "Restart needed";
         changes.color = tsl::infoTextColor;
-        changes.hint = std::string(GLYPH_R) + " Apply";
+        if (s.busy == Busy::None) {
+            changes.hint = std::string(GLYPH_R) + " Apply";
+        }
     } else {
         changes.value = "Up to date";
         changes.color = FaintColor();
@@ -769,7 +1080,7 @@ private:
 };
 
 // base for every page: a status panel on top, a scrolling list of settings
-// below, L / R to stop / start the server and periodic state polling.
+// below and L / R to stop / start the server.
 class PageGui : public tsl::Gui {
 public:
     explicit PageGui(std::string subtitle) : m_subtitle(std::move(subtitle)) {}
@@ -779,12 +1090,17 @@ public:
         auto list = new tsl::elm::List();
         Build(list);
         frame->setContent(list);
+        m_seen_version = StateVersion();
         Refresh();
         return frame;
     }
 
+    // the panel redraws from g_state every frame, list values only when the
+    // state changed. no io happens here, see Worker.
     void update() override {
-        if (PollState()) {
+        const auto version = StateVersion();
+        if (version != m_seen_version) {
+            m_seen_version = version;
             Refresh();
         }
     }
@@ -796,13 +1112,11 @@ public:
         };
 
         if (only(KEY_L)) {
-            StopAction();
-            Refresh();
+            RequestStop();
             return true;
         }
         if (only(KEY_R)) {
-            StartOrApplyAction();
-            Refresh();
+            RequestStartOrApply();
             return true;
         }
         return false;
@@ -811,19 +1125,19 @@ public:
     // a tapped panel row, see StatusFrame::onTouch().
     void OnPanelRowTapped(int row) {
         if (row == PanelRow_Server) {
-            if (g_state.running) {
-                StopAction();
+            bool running;
+            {
+                StateLock lock;
+                running = g_state.running;
+            }
+            if (running) {
+                RequestStop();
             } else {
-                StartOrApplyAction();
+                RequestStartOrApply();
             }
         } else if (row == PanelRow_Changes) {
-            if (g_state.running && g_state.dirty) {
-                StartOrApplyAction();
-            }
-        } else {
-            return;
+            RequestStartOrApply();
         }
-        Refresh();
     }
 
 protected:
@@ -834,17 +1148,14 @@ protected:
     // affects_server is false for overlay-only settings (the password
     // generator), which don't need the server to be restarted.
     void AddToggle(tsl::elm::List* list, const char* label, const BoolOption& opt, bool affects_server = true) {
+        // cfg is only written by the ui thread, so it can be read without the lock.
         auto item = new tsl::elm::ToggleListItem(label, g_state.cfg.*opt.field);
-        item->setStateChangedListener([this, item, &opt, affects_server](bool state) {
-            if (sys_ftpsrv_config_set_bool(opt.section, opt.key, state)) {
+        item->setStateChangedListener([&opt, affects_server](bool state) {
+            {
+                StateLock lock;
                 g_state.cfg.*opt.field = state;
-                if (affects_server) {
-                    MarkDirty();
-                }
-                Refresh();
-            } else {
-                item->setState(g_state.cfg.*opt.field);
             }
+            ChangeSetting(opt.section, opt.key, state ? "1" : "0", affects_server);
         });
         list->addItem(item);
     }
@@ -865,6 +1176,7 @@ protected:
 
 private:
     std::string m_subtitle;
+    u32 m_seen_version{};
 };
 
 bool StatusFrame::onTouch(tsl::elm::TouchEvent event, s32 currX, s32 currY, s32 prevX, s32 prevY, s32 initialX, s32 initialY) {
@@ -894,6 +1206,33 @@ bool StatusFrame::onTouch(tsl::elm::TouchEvent event, s32 currX, s32 currY, s32 
 // ---------------------------------------------------------------------------
 // pages
 // ---------------------------------------------------------------------------
+
+// sets a long setting from a list item that cycles through presets.
+template<std::size_t N>
+tsl::elm::ListItem* AddCycleItem(tsl::elm::List* list, const char* label, long SysFtpConfig::* field,
+                                 const std::array<long, N>& presets, const char* section, const char* key,
+                                 std::string (*format)(long), bool affects_server) {
+    auto item = new tsl::elm::ListItem(label, format(g_state.cfg.*field));
+    item->setClickListener([item, field, &presets, section, key, format, affects_server](u64 keys) {
+        if (keys & HidNpadButton_A) {
+            const auto value = NextPreset(presets, g_state.cfg.*field);
+            {
+                StateLock lock;
+                g_state.cfg.*field = value;
+            }
+            item->setValue(format(value));
+            ChangeSetting(section, key, std::to_string(value), affects_server);
+            return true;
+        }
+        return false;
+    });
+    list->addItem(item);
+    return item;
+}
+
+std::string FormatNumber(long value) {
+    return std::to_string(value);
+}
 
 class MountsPage final : public PageGui {
 public:
@@ -931,21 +1270,8 @@ public:
 protected:
     void Build(tsl::elm::List* list) override {
         list->addItem(new tsl::elm::CategoryHeader("Password generator"));
-
-        auto length_item = new tsl::elm::ListItem("Password length", std::to_string(g_state.cfg.pass_length));
-        length_item->setClickListener([length_item](u64 keys) {
-            if (keys & HidNpadButton_A) {
-                const auto length = NextPreset(PASS_LENGTH_PRESETS, g_state.cfg.pass_length);
-                if (sys_ftpsrv_config_set_long(SYS_FTPSRV_SECTION_PASSWORD, SYS_FTPSRV_KEY_PASS_LENGTH, length)) {
-                    g_state.cfg.pass_length = length;
-                    length_item->setValue(std::to_string(length));
-                }
-                return true;
-            }
-            return false;
-        });
-        list->addItem(length_item);
-
+        AddCycleItem(list, "Password length", &SysFtpConfig::pass_length, PASS_LENGTH_PRESETS,
+                     SYS_FTPSRV_SECTION_PASSWORD, SYS_FTPSRV_KEY_PASS_LENGTH, FormatNumber, false);
         AddToggle(list, "Uppercase only", OPT_pass_uppercase_only, false);
         AddToggle(list, "Special characters", OPT_pass_special_chars, false);
     }
@@ -959,11 +1285,10 @@ protected:
     void Build(tsl::elm::List* list) override {
         list->addItem(new tsl::elm::CategoryHeader("Advanced"));
 
+        // a single stat of a small file, fine to do whilst building the page.
         auto boot_item = new tsl::elm::ToggleListItem("Start on boot", IsBootEnabled());
-        boot_item->setStateChangedListener([boot_item](bool state) {
-            if (!SetBootEnabled(state)) {
-                boot_item->setState(IsBootEnabled());
-            }
+        boot_item->setStateChangedListener([](bool state) {
+            g_worker.Post(CommandType::SetBoot, state);
         });
         list->addItem(boot_item);
 
@@ -980,7 +1305,12 @@ public:
 
 protected:
     void Build(tsl::elm::List* list) override {
-        if (!g_state.installed) {
+        bool installed;
+        {
+            StateLock lock;
+            installed = g_state.installed;
+        }
+        if (!installed) {
             AddNote(list, {
                 "Sysmodule not found at:",
                 EXEFS_PATH,
@@ -1019,37 +1349,11 @@ protected:
         }, NoteStyle::Info);
 
         list->addItem(new tsl::elm::CategoryHeader("Network"));
-
-        m_port_item = new tsl::elm::ListItem("Port");
-        m_port_item->setClickListener([this](u64 keys) {
-            if (keys & HidNpadButton_A) {
-                const auto port = NextPreset(PORT_PRESETS, g_state.cfg.port);
-                if (sys_ftpsrv_config_set_long(SYS_FTPSRV_SECTION_NETWORK, SYS_FTPSRV_KEY_PORT, port)) {
-                    g_state.cfg.port = port;
-                    MarkDirty();
-                    Refresh();
-                }
-                return true;
-            }
-            return false;
-        });
-        list->addItem(m_port_item);
-
-        auto timeout_item = new tsl::elm::ListItem("Idle timeout", TimeoutToString(g_state.cfg.timeout));
-        timeout_item->setClickListener([this, timeout_item](u64 keys) {
-            if (keys & HidNpadButton_A) {
-                const auto timeout = NextPreset(TIMEOUT_PRESETS, g_state.cfg.timeout);
-                if (sys_ftpsrv_config_set_long(SYS_FTPSRV_SECTION_NETWORK, SYS_FTPSRV_KEY_TIMEOUT, timeout)) {
-                    g_state.cfg.timeout = timeout;
-                    timeout_item->setValue(TimeoutToString(timeout));
-                    MarkDirty();
-                    Refresh();
-                }
-                return true;
-            }
-            return false;
-        });
-        list->addItem(timeout_item);
+        // its value (and conflict color) is set in Refresh().
+        m_port_item = AddCycleItem(list, "Port", &SysFtpConfig::port, PORT_PRESETS,
+                                   SYS_FTPSRV_SECTION_NETWORK, SYS_FTPSRV_KEY_PORT, FormatNumber, true);
+        AddCycleItem(list, "Idle timeout", &SysFtpConfig::timeout, TIMEOUT_PRESETS,
+                     SYS_FTPSRV_SECTION_NETWORK, SYS_FTPSRV_KEY_TIMEOUT, TimeoutToString, true);
 
         list->addItem(new tsl::elm::CategoryHeader("More"));
         AddSubPage<MountsPage>(list, "Mounts");
@@ -1058,6 +1362,14 @@ protected:
     }
 
     void Refresh() override {
+        bool conflict, sphaira_running;
+        {
+            StateLock lock;
+            conflict = PortConflictLocked();
+            sphaira_running = SphairaServerRunningLocked();
+        }
+
+        // cfg is only written by the ui thread, so it can be read without the lock.
         const auto& cfg = g_state.cfg;
 
         if (cfg.user[0]) {
@@ -1075,9 +1387,9 @@ protected:
 
         // yellow: same port as sphaira. red: sphaira's server is running on it.
         m_port_item->clearValueColor();
-        if (PortConflict()) {
+        if (conflict) {
             m_port_item->setValue(std::to_string(cfg.port) + " (same as sphaira)", false);
-            m_port_item->setValueColor(SphairaServerRunning() ? tsl::warningTextColor : CAUTION_COLOR);
+            m_port_item->setValueColor(sphaira_running ? tsl::warningTextColor : CAUTION_COLOR);
         } else {
             m_port_item->setValue(std::to_string(cfg.port));
         }
@@ -1096,28 +1408,23 @@ private:
             next = (std::distance(presets.begin(), it) + 1) % presets.size();
         }
 
-        const auto& user = presets[next];
-        if (!sys_ftpsrv_config_set_string(SYS_FTPSRV_SECTION_LOGIN, SYS_FTPSRV_KEY_USER, user.c_str())) {
-            return;
+        const auto user = presets[next];
+        {
+            StateLock lock;
+            std::snprintf(g_state.cfg.user, sizeof(g_state.cfg.user), "%s", user.c_str());
         }
-
+        ChangeSetting(SYS_FTPSRV_SECTION_LOGIN, SYS_FTPSRV_KEY_USER, user);
         // keeps a hand-entered username in the list, so it can be cycled back to.
-        sys_ftpsrv_config_set_string(SYS_FTPSRV_SECTION_PRESETS, SYS_FTPSRV_KEY_USERS, JoinUserPresets(presets).c_str());
-
-        std::snprintf(g_state.cfg.user, sizeof(g_state.cfg.user), "%s", user.c_str());
-        MarkDirty();
-        Refresh();
+        ChangeSetting(SYS_FTPSRV_SECTION_PRESETS, SYS_FTPSRV_KEY_USERS, JoinUserPresets(presets), false);
     }
 
     void RegeneratePassword() {
         const auto pass = GeneratePassword(g_state.cfg);
-        if (!sys_ftpsrv_config_set_string(SYS_FTPSRV_SECTION_LOGIN, SYS_FTPSRV_KEY_PASS, pass.c_str())) {
-            return;
+        {
+            StateLock lock;
+            std::snprintf(g_state.cfg.pass, sizeof(g_state.cfg.pass), "%s", pass.c_str());
         }
-
-        std::snprintf(g_state.cfg.pass, sizeof(g_state.cfg.pass), "%s", pass.c_str());
-        MarkDirty();
-        Refresh();
+        ChangeSetting(SYS_FTPSRV_SECTION_LOGIN, SYS_FTPSRV_KEY_PASS, pass);
     }
 
 private:
@@ -1149,6 +1456,9 @@ public:
     }
 
     void exitServices() override {
+        // writes any setting still queued before the services it needs go away.
+        g_worker.Stop();
+
         if (g_sockets_ready) {
             socketExit();
             g_sockets_ready = false;
@@ -1157,8 +1467,18 @@ public:
         pmshellExit();
     }
 
+    void onShow() override {
+        g_worker.SetVisible(true);
+    }
+
+    void onHide() override {
+        g_worker.SetVisible(false);
+    }
+
     std::unique_ptr<tsl::Gui> loadInitialGui() override {
         LoadState();
+        g_worker.PollOnce();
+        g_worker.Start();
         return initially<MainPage>();
     }
 };

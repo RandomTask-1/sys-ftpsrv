@@ -121,7 +121,7 @@ static void io_delete(const char* path) {
 
 typedef struct {
     IoFile* file;
-    char buf[512];
+    char buf[1024];
     long long buf_offset;   // file offset of buf[0]
     long len;
     long pos;
@@ -371,12 +371,32 @@ typedef struct {
     IoFile* dst;
     long long dst_offset;
     bool ok;
+    // writes are batched, each fs call is an ipc round trip on the switch.
+    char out[1024];
+    unsigned long out_len;
 } Copier;
 
+static void copier_flush(Copier* c) {
+    if (c->ok && c->out_len) {
+        c->ok = io_write_at(c->dst, c->dst_offset, c->out, c->out_len);
+        c->dst_offset += c->out_len;
+    }
+    c->out_len = 0;
+}
+
 static void copier_write(Copier* c, const char* data, unsigned long size) {
-    if (c->ok && size) {
-        c->ok = io_write_at(c->dst, c->dst_offset, data, size);
-        c->dst_offset += size;
+    while (c->ok && size) {
+        unsigned long chunk = sizeof(c->out) - c->out_len;
+        if (chunk > size) {
+            chunk = size;
+        }
+        memcpy(c->out + c->out_len, data, chunk);
+        c->out_len += chunk;
+        data += chunk;
+        size -= chunk;
+        if (c->out_len == sizeof(c->out)) {
+            copier_flush(c);
+        }
     }
 }
 
@@ -386,7 +406,7 @@ static void copier_write_str(Copier* c, const char* str) {
 
 // copies src[from, to), to < 0 means until the end of the file.
 static void copier_copy(Copier* c, long long from, long long to) {
-    char buf[512];
+    char buf[1024];
     while (c->ok && (to < 0 || from < to)) {
         unsigned long chunk = sizeof(buf);
         if (to >= 0 && (long long)chunk > to - from) {
@@ -470,7 +490,11 @@ bool cfgini_set(const char* path, const char* section, const char* key, const ch
         return false;
     }
 
-    Copier c = { src_exists ? &src : NULL, &dst, 0, true };
+    static const Copier copier_init = { 0 };
+    Copier c = copier_init;
+    c.src = src_exists ? &src : NULL;
+    c.dst = &dst;
+    c.ok = true;
 
     if (replace_start >= 0) {
         copier_copy(&c, 0, replace_start);
@@ -502,6 +526,7 @@ bool cfgini_set(const char* path, const char* section, const char* key, const ch
         copier_write_str(&c, "\n");
     }
 
+    copier_flush(&c);
     io_close(&dst);
     if (src_exists) {
         io_close(&src);
