@@ -1,0 +1,90 @@
+##############
+# sys-ftpsrv #
+##############
+
+#######################################################################
+# Rename config.ini.template to config.ini for changes to take effect.#
+# The overlay does this automatically the first time a setting is     #
+# changed. Restart the server (or use "Apply changes") after editing. #
+#######################################################################
+
+[Login]
+# allow login without a user / pass.
+# disabled by default, do not enable if using ldn_mitm as
+# it's a security risk - you have been warned!
+anon = 0
+
+# if anon is disabled, then user and pass must be set,
+# otherwise the sysmodule will not start.
+# in the overlay, A on Username cycles through [Presets] users and
+# A on Password generates a new random password.
+user = ""
+pass = ""
+
+# reject all uploads, deletes and renames.
+read_only = 0
+
+[Network]
+# 5000 matches sys-ftpd.
+# WARNING: sphaira's built in ftp server also defaults to 5000 (and its
+# FTP Install menu always starts it). if both use the same port, whichever
+# starts first gets it and the other silently keeps retrying. change one of
+# them, or stop this server whilst using sphaira's ftp.
+port = 5000
+
+# timeout in seconds until an idle session is closed.
+# if 0, then no timeout is set.
+timeout = 0
+
+[Misc]
+# use local time zone over gm (UTC) time zone.
+use_localtime = 0
+
+# enables log output to /config/sys-ftpsrv/log.txt
+log = 0
+
+# flash the controller led during transfers.
+led = 0
+
+# set to disable converting non-ascii characters to _
+skip_ascii_convert = 0
+
+# extra mount points. if any of these are enabled, the root "/" lists every
+# mounted device (the sd card is then at "/sdmc:") rather than the sd card.
+[Mounts]
+# screenshots and videos, nand and sd.
+album = 0
+# shortcut to /switch
+switch = 0
+# shortcut to /atmosphere/contents
+ams_contents = 0
+# browse save data of every installed title (read only by default).
+saves = 0
+# WARNING: allows modifying save data, keep backups!
+saves_writable = 0
+# browse the inserted gamecard.
+# WARNING: the gamecard is kept open whilst browsing it, which may conflict
+# with sphaira's gamecard menu (sphaira's own ftp server disables this).
+gamecard = 0
+# installed content (nca) storage.
+content_system = 0
+content_user = 0
+content_sd = 0
+# WARNING: modifying bis files can soft brick your switch!
+bis_fs = 0
+# raw bis partitions (read only).
+bis_storage = 0
+
+# overlay only settings, the sysmodule ignores these.
+[Presets]
+# comma separated usernames the overlay cycles through.
+users = switch,ftpd
+
+[Password]
+# settings for the overlay's password generator.
+# length: 4, 6, 8, 10 or 12 from the overlay (any 4 - 64 here).
+length = 6
+# 1 = uppercase letters only, 0 = mixed case.
+uppercase_only = 1
+# include !@#$%^&* characters.
+special_chars = 1

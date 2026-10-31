@@ -1,0 +1,14 @@
+sys-ftpsrv is made of parts under different licenses, each source file states
+its own with an SPDX-License-Identifier line.
+
+  sysmodule/, common/, cmake/, assets/, build files    MIT           LICENSE-MIT
+  overlay/                                             GPL-2.0-or-later  licenses/GPL-2.0.txt
+
+The overlay is GPL because it is built with libultrahand (GPL-2.0, with its
+libultra part also under CC-BY-4.0). The sysmodule contains no GPL code.
+
+sysmodule/source/main.c is based on ftpsrv's src/platform/nx/main_sysmod.c,
+Copyright (c) 2024 TotalJustice, MIT.
+
+Third party components, and which binary they end up in, are listed in
+THIRD_PARTY_LICENSES.md, with their full license texts in licenses/.

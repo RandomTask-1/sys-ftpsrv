@@ -1,0 +1,6 @@
+build/
+out/
+*.zip
+compile_commands.json
+.vscode/
+.idea/

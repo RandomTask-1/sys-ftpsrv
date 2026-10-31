@@ -1,0 +1,5 @@
+{
+    "name"  : "sys-ftpsrv",
+    "tid"   : "@SYS_FTPSRV_PROGRAM_ID@",
+    "requires_reboot": false
+}

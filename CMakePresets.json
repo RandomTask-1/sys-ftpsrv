@@ -1,0 +1,40 @@
+{
+    "version": 3,
+    "cmakeMinimumRequired": {
+        "major": 3,
+        "minor": 21,
+        "patch": 0
+    },
+    "configurePresets": [
+        {
+            "name": "Release",
+            "displayName": "Release",
+            "binaryDir": "${sourceDir}/build/${presetName}",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "MinSizeRel",
+                "LTO": true
+            }
+        },
+        {
+            "name": "Dev",
+            "displayName": "Dev",
+            "binaryDir": "${sourceDir}/build/${presetName}",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "MinSizeRel",
+                "LTO": false
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "Release",
+            "configurePreset": "Release",
+            "jobs": 16
+        },
+        {
+            "name": "Dev",
+            "configurePreset": "Dev",
+            "jobs": 16
+        }
+    ]
+}
